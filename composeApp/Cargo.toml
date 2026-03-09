@@ -4,7 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-uniffi = "0.29.4"
+uniffi = "0.29.5"
+thiserror = "2.0.18"
+chacha20poly1305 = "0.10.1"
+argon2 = "0.5.3"
+rand = "0.10.0"
+typenum = "1.19.0"
+tokio = { version = "1.50.0", features = ["sync"] }
+
+[dev-dependencies]
+tokio = {version = "1.50.0", features = ["macros", "rt"]}
 
 [lib]
 crate-type = ["cdylib", "staticlib"]
