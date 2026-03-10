@@ -1,4 +1,3 @@
-use argon2::Argon2;
 use chacha20poly1305::{AeadInPlace, Key, KeyInit, Tag, XChaCha20Poly1305, XNonce};
 use rand::RngExt;
 use rand::prelude::{Rng, ThreadRng};
@@ -72,21 +71,32 @@ pub enum VaultError {
 
 #[derive(uniffi::Object, Clone, Serialize, Deserialize)]
 pub struct VaultMetadata {
-    password_salt: [u8; 32],
+    password_salt: [u8; Self::SALT_LENGTH],
     encrypted_dek: Encrypted<Key>,
 }
 
 impl VaultMetadata {
+    const SALT_LENGTH: usize = 16;
     /// Internal helper to derive the Key Encryption Key (KEK) from a password and salt.
     ///
     /// This uses `std::thread` rather than `tokio::task::spawn_blocking` to remain
     /// runtime-agnostic. This allows the library to function in environments where
     /// a Tokio executor might not be fully configured.
-    async fn derive_kek(password: String, salt: [u8; 32]) -> Result<Key, VaultError> {
+    async fn derive_kek(
+        password: Zeroizing<String>,
+        salt: [u8; Self::SALT_LENGTH],
+    ) -> Result<Key, VaultError> {
         let (send, recv) = tokio::sync::oneshot::channel();
         std::thread::spawn(move || {
+            use argon2::*;
             let mut kek = Key::default();
-            let result = Argon2::default()
+            #[cfg(not(test))]
+            let m_cost = 64 * 1024;
+            #[cfg(test)]
+            let m_cost = 8 * 1024;
+            let params = Params::new(m_cost, 3, 4, Some(32)).unwrap();
+            let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+            let result = argon2
                 .hash_password_into(password.as_bytes(), &salt, &mut kek)
                 .map(|_| kek)
                 .map_err(|_| VaultError::Kdf);
@@ -102,14 +112,14 @@ impl VaultMetadata {
     pub async fn temporary(password: String) -> Result<Self, VaultError> {
         let (password_salt, dek) = {
             let mut rng = ThreadRng::default();
-            let mut salt = [0u8; 32];
+            let mut salt = [0u8; Self::SALT_LENGTH];
             let mut dek = Key::default();
             rng.fill_bytes(&mut salt);
             rng.fill_bytes(&mut dek);
             (salt, dek)
         };
 
-        let kek = Self::derive_kek(password, password_salt).await?;
+        let kek = Self::derive_kek(Zeroizing::new(password), password_salt).await?;
         let kek_cipher = XChaCha20Poly1305::new(&kek);
         let encrypted_dek =
             Encrypted::encrypt(&kek_cipher, dek).map_err(|_| VaultError::Encryption)?;
@@ -121,7 +131,7 @@ impl VaultMetadata {
     }
 
     pub async fn unlock(self: Arc<Self>, password: String) -> Result<Vault, VaultError> {
-        let kek = Self::derive_kek(password, self.password_salt).await?;
+        let kek = Self::derive_kek(Zeroizing::new(password), self.password_salt).await?;
         let kek_cipher = XChaCha20Poly1305::new(&kek);
 
         let dek = self
@@ -321,8 +331,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_fails_on_corrupted_bytes() {
-        let corrupted_bytes = vec![0u8; 100];
-        // Even with the "correct" password, deserialization of the storage structure should fail
+        let corrupted_bytes = vec![1u8; 100];
         let result = Vault::load(corrupted_bytes, "password123".to_string()).await;
 
         assert!(matches!(result, Err(VaultError::Deserialization)));
