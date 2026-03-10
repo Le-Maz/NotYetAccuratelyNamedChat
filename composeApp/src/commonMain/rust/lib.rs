@@ -1,19 +1,46 @@
 use argon2::Argon2;
-use chacha20poly1305::aead::generic_array::{ArrayLength, GenericArray};
 use chacha20poly1305::{AeadInPlace, Key, KeyInit, Tag, XChaCha20Poly1305, XNonce};
+use rand::RngExt;
 use rand::prelude::{Rng, ThreadRng};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use typenum::Unsigned;
+use std::sync::{Arc, RwLock};
+use zeroize::Zeroizing;
 
 uniffi::setup_scaffolding!();
 
-trait WithLength<T> {
-    type Length: ArrayLength<T>;
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Encrypted<T>
+where
+    T: AsMut<[u8]>,
+{
+    nonce: XNonce,
+    ciphertext: T,
+    tag: Tag,
 }
 
-impl<T, N: ArrayLength<T>> WithLength<T> for GenericArray<T, N> {
-    type Length = N;
+impl<T> Encrypted<T>
+where
+    T: AsMut<[u8]>,
+{
+    pub fn encrypt(
+        cipher: &XChaCha20Poly1305,
+        mut data: T,
+    ) -> Result<Encrypted<T>, chacha20poly1305::Error> {
+        let mut nonce = XNonce::default();
+        ThreadRng::default().fill(&mut nonce);
+        let tag = cipher.encrypt_in_place_detached(&nonce, &[], data.as_mut())?;
+        Ok(Self {
+            nonce,
+            ciphertext: data,
+            tag,
+        })
+    }
+    pub fn decrypt(self, cipher: &XChaCha20Poly1305) -> Result<T, chacha20poly1305::Error> {
+        let mut data = self.ciphertext;
+        cipher.decrypt_in_place_detached(&self.nonce, &[], data.as_mut(), &self.tag)?;
+        Ok(data)
+    }
 }
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -25,31 +52,36 @@ pub enum VaultError {
     SessionMissing,
 
     #[error("kdf failure")]
-    KdfFailed,
+    Kdf,
 
     #[error("encryption failure")]
-    EncryptionFailed,
+    Encryption,
 
     #[error("decryption failure")]
-    DecryptionFailed,
+    Decryption,
+
+    #[error("serialization failure")]
+    Serialization,
+
+    #[error("deserialization failure")]
+    Deserialization,
 
     #[error("secret not found")]
     SecretNotFound,
 }
 
-const X_NONCE_LENGTH: usize = <XNonce as WithLength<u8>>::Length::USIZE;
-const KEY_LENGTH: usize = <Key as WithLength<u8>>::Length::USIZE;
-const TAG_LENGTH: usize = <Tag as WithLength<u8>>::Length::USIZE;
-const ENCRYPTED_DEK_LENGTH: usize = X_NONCE_LENGTH + KEY_LENGTH + TAG_LENGTH;
-
-#[derive(uniffi::Object)]
+#[derive(uniffi::Object, Clone, Serialize, Deserialize)]
 pub struct VaultMetadata {
     password_salt: [u8; 32],
-    encrypted_dek: [u8; ENCRYPTED_DEK_LENGTH],
+    encrypted_dek: Encrypted<Key>,
 }
 
 impl VaultMetadata {
     /// Internal helper to derive the Key Encryption Key (KEK) from a password and salt.
+    ///
+    /// This uses `std::thread` rather than `tokio::task::spawn_blocking` to remain
+    /// runtime-agnostic. This allows the library to function in environments where
+    /// a Tokio executor might not be fully configured.
     async fn derive_kek(password: String, salt: [u8; 32]) -> Result<Key, VaultError> {
         let (send, recv) = tokio::sync::oneshot::channel();
         std::thread::spawn(move || {
@@ -57,21 +89,10 @@ impl VaultMetadata {
             let result = Argon2::default()
                 .hash_password_into(password.as_bytes(), &salt, &mut kek)
                 .map(|_| kek)
-                .map_err(|_| VaultError::KdfFailed);
+                .map_err(|_| VaultError::Kdf);
             send.send(result).unwrap();
         });
-        Ok(recv.await.map_err(|_| VaultError::KdfFailed)??)
-    }
-
-    /// Splits the encrypted_dek buffer into its constituent parts: (Nonce, Encrypted Key, Tag).
-    fn unpack_dek(&self) -> (&XNonce, &Key, &Tag) {
-        let (nonce, rest) = self.encrypted_dek.split_at(X_NONCE_LENGTH);
-        let (encrypted_key, tag) = rest.split_at(KEY_LENGTH);
-        (
-            XNonce::from_slice(nonce),
-            Key::from_slice(encrypted_key),
-            Tag::from_slice(tag),
-        )
+        Ok(recv.await.map_err(|_| VaultError::Kdf)??)
     }
 }
 
@@ -79,111 +100,103 @@ impl VaultMetadata {
 impl VaultMetadata {
     #[uniffi::constructor]
     pub async fn temporary(password: String) -> Result<Self, VaultError> {
-        let (salt, mut dek, nonce) = {
+        let (password_salt, dek) = {
             let mut rng = ThreadRng::default();
             let mut salt = [0u8; 32];
             let mut dek = Key::default();
-            let mut nonce = XNonce::default();
             rng.fill_bytes(&mut salt);
             rng.fill_bytes(&mut dek);
-            rng.fill_bytes(&mut nonce);
-            (salt, dek, nonce)
+            (salt, dek)
         };
 
-        let kek = Self::derive_kek(password, salt).await?;
-
-        let tag = XChaCha20Poly1305::new(&kek)
-            .encrypt_in_place_detached(&nonce, &[], &mut dek)
-            .map_err(|_| VaultError::EncryptionFailed)?;
-
-        let mut combined = [0u8; ENCRYPTED_DEK_LENGTH];
-        let (n_slice, rest) = combined.split_at_mut(X_NONCE_LENGTH);
-        let (d_slice, t_slice) = rest.split_at_mut(KEY_LENGTH);
-
-        n_slice.copy_from_slice(&nonce);
-        d_slice.copy_from_slice(&dek);
-        t_slice.copy_from_slice(&tag);
+        let kek = Self::derive_kek(password, password_salt).await?;
+        let kek_cipher = XChaCha20Poly1305::new(&kek);
+        let encrypted_dek =
+            Encrypted::encrypt(&kek_cipher, dek).map_err(|_| VaultError::Encryption)?;
 
         Ok(Self {
-            password_salt: salt,
-            encrypted_dek: combined,
+            password_salt,
+            encrypted_dek,
         })
     }
 
     pub async fn unlock(self: Arc<Self>, password: String) -> Result<Vault, VaultError> {
         let kek = Self::derive_kek(password, self.password_salt).await?;
+        let kek_cipher = XChaCha20Poly1305::new(&kek);
 
-        let (nonce, dek, tag) = self.unpack_dek();
-        let mut dek = dek.to_owned();
-        XChaCha20Poly1305::new(&kek)
-            .decrypt_in_place_detached(nonce, &[], &mut dek, tag)
-            .map_err(|_| VaultError::DecryptionFailed)?;
+        let dek = self
+            .encrypted_dek
+            .clone()
+            .decrypt(&kek_cipher)
+            .map_err(|_| VaultError::Decryption)?;
 
         Ok(Vault {
             metadata: self,
-            dek,
-            secrets: Mutex::new(Default::default()),
+            dek: Zeroizing::new(dek),
+            secrets: RwLock::new(Default::default()),
         })
     }
-}
-
-#[derive(Clone)]
-struct EncryptedStore {
-    nonce: [u8; X_NONCE_LENGTH],
-    ciphertext: Vec<u8>,
 }
 
 #[derive(uniffi::Object)]
 #[allow(unused)]
 pub struct Vault {
     metadata: Arc<VaultMetadata>,
-    dek: Key,
-    secrets: Mutex<HashMap<String, EncryptedStore>>,
+    dek: Zeroizing<Key>,
+    secrets: RwLock<HashMap<String, Encrypted<Vec<u8>>>>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct VaultStorage {
+    metadata: VaultMetadata,
+    secrets: HashMap<String, Encrypted<Vec<u8>>>,
 }
 
 #[uniffi::export]
 impl Vault {
-    pub async fn insert_secret(&self, key: String, mut value: Vec<u8>) -> Result<(), VaultError> {
-        let mut rng = ThreadRng::default();
-        let mut nonce_bytes = [0u8; X_NONCE_LENGTH];
-        rng.fill_bytes(&mut nonce_bytes);
-        let nonce = XNonce::from_slice(&nonce_bytes);
-
+    pub async fn insert_secret(&self, key: String, value: Vec<u8>) -> Result<(), VaultError> {
         let cipher = XChaCha20Poly1305::new(&self.dek);
-        cipher
-            .encrypt_in_place(nonce, &[], &mut value)
-            .map_err(|_| VaultError::EncryptionFailed)?;
+        let value = Encrypted::encrypt(&cipher, value).map_err(|_| VaultError::Encryption)?;
 
-        let mut secrets = self.secrets.lock().unwrap();
-        secrets.insert(
-            key,
-            EncryptedStore {
-                nonce: nonce_bytes,
-                ciphertext: value,
-            },
-        );
+        let mut secrets = self.secrets.write().unwrap();
+        secrets.insert(key, value);
 
         Ok(())
     }
 
     pub async fn get_secret(&self, key: String) -> Result<Vec<u8>, VaultError> {
-        let secrets = self.secrets.lock().unwrap();
+        let secrets = self.secrets.read().unwrap();
         let stored = secrets.get(&key).ok_or(VaultError::SecretNotFound)?;
 
-        let nonce = XNonce::from_slice(&stored.nonce);
-
-        if stored.ciphertext.len() < TAG_LENGTH {
-            return Err(VaultError::DecryptionFailed);
-        }
-
-        let mut buffer = stored.ciphertext.clone();
-
         let cipher = XChaCha20Poly1305::new(&self.dek);
-        cipher
-            .decrypt_in_place(nonce, &[], &mut buffer)
-            .map_err(|_| VaultError::DecryptionFailed)?;
+        let value = stored
+            .clone()
+            .decrypt(&cipher)
+            .map_err(|_| VaultError::Decryption)?;
 
-        Ok(buffer)
+        Ok(value)
+    }
+
+    pub fn save(&self) -> Result<Vec<u8>, VaultError> {
+        let secrets = self.secrets.read().unwrap();
+        let storage = VaultStorage {
+            metadata: (*self.metadata).clone(),
+            secrets: secrets.clone(),
+        };
+        postcard::to_stdvec(&storage).map_err(|_| VaultError::Serialization)
+    }
+
+    #[uniffi::constructor]
+    pub async fn load(bytes: Vec<u8>, password: String) -> Result<Self, VaultError> {
+        let storage: VaultStorage =
+            postcard::from_bytes(&bytes).map_err(|_| VaultError::Deserialization)?;
+
+        let metadata = Arc::new(storage.metadata);
+        let mut vault = metadata.unlock(password).await?;
+
+        *vault.secrets.get_mut().unwrap() = storage.secrets;
+
+        Ok(vault)
     }
 }
 
@@ -256,5 +269,82 @@ mod tests {
         let result = vault.get_secret("ghost".to_string()).await;
 
         assert!(matches!(result, Err(VaultError::SecretNotFound)));
+    }
+
+    #[tokio::test]
+    async fn vault_save_and_load_round_trip() {
+        // 1. Setup initial vault and data
+        let initial_vault = setup_vault().await;
+        let key = "persistence_test".to_string();
+        let value = b"this data should survive serialization".to_vec();
+
+        initial_vault
+            .insert_secret(key.clone(), value.clone())
+            .await
+            .unwrap();
+
+        // 2. Serialize to bytes (Postcard)
+        let serialized_data = initial_vault
+            .save()
+            .expect("Should be able to serialize vault");
+        assert!(
+            !serialized_data.is_empty(),
+            "Serialized data should not be empty"
+        );
+
+        // 3. Load into a completely new instance
+        let loaded_vault = Vault::load(serialized_data, "password123".to_string())
+            .await
+            .expect("Should be able to load vault with correct password");
+
+        // 4. Verify data integrity
+        let retrieved = loaded_vault.get_secret(key).await.unwrap();
+        assert_eq!(retrieved, value, "Retrieved data must match original data");
+    }
+
+    #[tokio::test]
+    async fn load_fails_with_incorrect_password() {
+        let vault = setup_vault().await;
+        vault
+            .insert_secret("secret".into(), b"data".into())
+            .await
+            .unwrap();
+
+        let bytes = vault.save().unwrap();
+
+        // Attempt to load with a typo/wrong password
+        let result = Vault::load(bytes, "wrong_password".to_string()).await;
+
+        assert!(result.is_err(), "Loading with wrong password must fail");
+        // Specifically, it should fail during the DEK decryption in metadata.unlock()
+    }
+
+    #[tokio::test]
+    async fn load_fails_on_corrupted_bytes() {
+        let corrupted_bytes = vec![0u8; 100];
+        // Even with the "correct" password, deserialization of the storage structure should fail
+        let result = Vault::load(corrupted_bytes, "password123".to_string()).await;
+
+        assert!(matches!(result, Err(VaultError::Deserialization)));
+    }
+
+    #[tokio::test]
+    async fn vault_metadata_remains_consistent_after_load() {
+        let metadata = Arc::new(
+            VaultMetadata::temporary(PASSWORD.to_string())
+                .await
+                .unwrap(),
+        );
+        let original_salt = metadata.password_salt;
+
+        let vault = metadata.unlock(PASSWORD.to_string()).await.unwrap();
+        let bytes = vault.save().unwrap();
+
+        let loaded_vault = Vault::load(bytes, PASSWORD.to_string()).await.unwrap();
+
+        assert_eq!(
+            loaded_vault.metadata.password_salt, original_salt,
+            "Salt must persist across save/load"
+        );
     }
 }
