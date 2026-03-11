@@ -9,7 +9,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import uniffi.compose_app.Vault
-import uniffi.compose_app.VaultMetadata
+import uniffi.compose_app.Database
 
 /**
  * State manager for the Vault.
@@ -18,7 +18,9 @@ object VaultManager {
     var activeVault by mutableStateOf<Vault?>(null)
         private set
 
-    var metadata by mutableStateOf<VaultMetadata?>(null)
+    // Simple flag to determine if we are setting up for the first time
+    // In a real app, you'd check database.hasMetadata()
+    var isVaultInitialized by mutableStateOf(false)
 
     fun unlock(vault: Vault) {
         activeVault = vault
@@ -30,7 +32,7 @@ object VaultManager {
 }
 
 @Composable
-fun App() {
+fun App(database: Database) {
     MaterialTheme {
         Surface(
             modifier = Modifier.fillMaxSize(),
@@ -40,9 +42,12 @@ fun App() {
 
             if (currentVault == null) {
                 UnlockVaultScreen(
-                    metadata = VaultManager.metadata,
-                    onVaultUnlocked = { VaultManager.unlock(it) },
-                    onMetadataCreated = { VaultManager.metadata = it }
+                    database = database,
+                    isCreationMode = !VaultManager.isVaultInitialized,
+                    onVaultUnlocked = {
+                        VaultManager.isVaultInitialized = true
+                        VaultManager.unlock(it)
+                    }
                 )
             } else {
                 AuthenticatedVaultScreen(
@@ -58,16 +63,14 @@ fun App() {
  */
 @Composable
 fun UnlockVaultScreen(
-    metadata: VaultMetadata?,
-    onVaultUnlocked: (Vault) -> Unit,
-    onMetadataCreated: (VaultMetadata) -> Unit
+    database: Database,
+    isCreationMode: Boolean,
+    onVaultUnlocked: (Vault) -> Unit
 ) {
     val scope = rememberCoroutineScope()
     var password by remember { mutableStateOf("") }
     var isLoading by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
-
-    val isCreationMode = metadata == null
 
     Column(
         modifier = Modifier
@@ -110,16 +113,16 @@ fun UnlockVaultScreen(
                     errorMessage = null
                     try {
                         val vault = if (isCreationMode) {
-                            val newMeta = VaultMetadata.create(password)
-                            onMetadataCreated(newMeta)
-                            newMeta.unlock(password)
+                            // Directly use the static constructor
+                            Vault.create(database, "default_vault", password)
                         } else {
-                            metadata.unlock(password)
+                            // Directly use the static loader
+                            Vault.load(database, "default_vault", password)
                         }
 
                         onVaultUnlocked(vault)
-                        password = "" // Clear sensitive data from memory
-                    } catch (_: Exception) {
+                        password = ""
+                    } catch (e: Exception) {
                         errorMessage = "Invalid password or encryption error"
                     } finally {
                         isLoading = false
@@ -130,7 +133,7 @@ fun UnlockVaultScreen(
             if (isLoading) {
                 CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
             } else {
-                Text("Enter")
+                Text(if (isCreationMode) "Create" else "Enter")
             }
         }
     }
@@ -152,7 +155,6 @@ fun AuthenticatedVaultScreen(onLockRequested: () -> Unit) {
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        // Placeholder for vault content (e.g., a list of secrets)
         Card(
             modifier = Modifier.fillMaxWidth().weight(1f, fill = false),
             colors = CardDefaults.cardColors(
@@ -177,9 +179,6 @@ fun AuthenticatedVaultScreen(onLockRequested: () -> Unit) {
     }
 }
 
-/**
- * A reusable password input field.
- */
 @Composable
 fun PasswordTextField(
     value: String,

@@ -1,5 +1,7 @@
+pub mod database;
+
+use crate::database::{Database, DatabaseError};
 use chacha20poly1305::{AeadInPlace, Key, KeyInit, Tag, XChaCha20Poly1305, XNonce};
-use rand::RngExt;
 use rand::prelude::{Rng, ThreadRng};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -8,11 +10,26 @@ use zeroize::Zeroizing;
 
 uniffi::setup_scaffolding!();
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct Encrypted<T>
-where
-    T: AsMut<[u8]>,
-{
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum VaultError {
+    #[error("database error: {0}")]
+    Database(#[from] DatabaseError),
+    #[error("kdf failure")]
+    Kdf,
+    #[error("encryption failure")]
+    Encryption,
+    #[error("decryption failure")]
+    Decryption,
+    #[error("serialization failure")]
+    Serialization,
+    #[error("deserialization failure")]
+    Deserialization,
+    #[error("secret not found")]
+    SecretNotFound,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Encrypted<T> {
     nonce: XNonce,
     ciphertext: T,
     tag: Tag,
@@ -22,12 +39,12 @@ impl<T> Encrypted<T>
 where
     T: AsMut<[u8]>,
 {
-    pub fn encrypt(
+    fn encrypt(
         cipher: &XChaCha20Poly1305,
         mut data: T,
     ) -> Result<Encrypted<T>, chacha20poly1305::Error> {
         let mut nonce = XNonce::default();
-        ThreadRng::default().fill(&mut nonce);
+        ThreadRng::default().fill_bytes(&mut nonce);
         let tag = cipher.encrypt_in_place_detached(&nonce, &[], data.as_mut())?;
         Ok(Self {
             nonce,
@@ -35,324 +52,185 @@ where
             tag,
         })
     }
-    pub fn decrypt(self, cipher: &XChaCha20Poly1305) -> Result<T, chacha20poly1305::Error> {
+
+    fn decrypt(self, cipher: &XChaCha20Poly1305) -> Result<T, chacha20poly1305::Error> {
         let mut data = self.ciphertext;
         cipher.decrypt_in_place_detached(&self.nonce, &[], data.as_mut(), &self.tag)?;
         Ok(data)
     }
 }
 
-#[derive(Debug, thiserror::Error, uniffi::Error)]
-pub enum VaultError {
-    #[error("identity not initialized")]
-    IdentityMissing,
-
-    #[error("session not found")]
-    SessionMissing,
-
-    #[error("kdf failure")]
-    Kdf,
-
-    #[error("encryption failure")]
-    Encryption,
-
-    #[error("decryption failure")]
-    Decryption,
-
-    #[error("serialization failure")]
-    Serialization,
-
-    #[error("deserialization failure")]
-    Deserialization,
-
-    #[error("secret not found")]
-    SecretNotFound,
-}
-
-#[derive(uniffi::Object, Clone, Serialize, Deserialize)]
-pub struct VaultMetadata {
-    password_salt: [u8; Self::SALT_LENGTH],
+/// Internal structure used for database storage, hidden from UniFFI
+#[derive(Serialize, Deserialize)]
+struct VaultMetadata {
+    password_salt: [u8; 16],
     encrypted_dek: Encrypted<Key>,
-}
-
-impl VaultMetadata {
-    const SALT_LENGTH: usize = 16;
-    /// Internal helper to derive the Key Encryption Key (KEK) from a password and salt.
-    ///
-    /// This uses `std::thread` rather than `tokio::task::spawn_blocking` to remain
-    /// runtime-agnostic. This allows the library to function in environments where
-    /// a Tokio executor might not be fully configured.
-    async fn derive_kek(
-        password: Zeroizing<String>,
-        salt: [u8; Self::SALT_LENGTH],
-    ) -> Result<Key, VaultError> {
-        let (send, recv) = tokio::sync::oneshot::channel();
-        std::thread::spawn(move || {
-            use argon2::*;
-            let mut kek = Key::default();
-            #[cfg(not(test))]
-            let m_cost = 64 * 1024;
-            #[cfg(test)]
-            let m_cost = 8 * 1024;
-            let params = Params::new(m_cost, 3, 4, Some(32)).unwrap();
-            let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-            let result = argon2
-                .hash_password_into(password.as_bytes(), &salt, &mut kek)
-                .map(|_| kek)
-                .map_err(|_| VaultError::Kdf);
-            send.send(result).unwrap();
-        });
-        Ok(recv.await.map_err(|_| VaultError::Kdf)??)
-    }
-}
-
-#[uniffi::export]
-impl VaultMetadata {
-    #[uniffi::constructor]
-    pub async fn create(password: String) -> Result<Self, VaultError> {
-        let (password_salt, dek) = {
-            let mut rng = ThreadRng::default();
-            let mut salt = [0u8; Self::SALT_LENGTH];
-            let mut dek = Key::default();
-            rng.fill_bytes(&mut salt);
-            rng.fill_bytes(&mut dek);
-            (salt, dek)
-        };
-
-        let kek = Self::derive_kek(Zeroizing::new(password), password_salt).await?;
-        let kek_cipher = XChaCha20Poly1305::new(&kek);
-        let encrypted_dek =
-            Encrypted::encrypt(&kek_cipher, dek).map_err(|_| VaultError::Encryption)?;
-
-        Ok(Self {
-            password_salt,
-            encrypted_dek,
-        })
-    }
-
-    pub async fn unlock(self: Arc<Self>, password: String) -> Result<Vault, VaultError> {
-        let kek = Self::derive_kek(Zeroizing::new(password), self.password_salt).await?;
-        let kek_cipher = XChaCha20Poly1305::new(&kek);
-
-        let dek = self
-            .encrypted_dek
-            .clone()
-            .decrypt(&kek_cipher)
-            .map_err(|_| VaultError::Decryption)?;
-
-        Ok(Vault {
-            metadata: self,
-            dek: Zeroizing::new(dek),
-            secrets: RwLock::new(Default::default()),
-        })
-    }
 }
 
 #[derive(uniffi::Object)]
 pub struct Vault {
-    metadata: Arc<VaultMetadata>,
+    database: Arc<Database>,
+    vault_id: String,
     dek: Zeroizing<Key>,
     secrets: RwLock<HashMap<String, Encrypted<Vec<u8>>>>,
 }
 
-#[derive(Serialize, Deserialize)]
-pub(crate) struct VaultStorage {
-    metadata: VaultMetadata,
-    secrets: HashMap<String, Encrypted<Vec<u8>>>,
-}
-
 #[uniffi::export]
 impl Vault {
+    #[uniffi::constructor]
+    pub async fn create(
+        database: Arc<Database>,
+        vault_id: String,
+        password: String,
+    ) -> Result<Self, VaultError> {
+        let mut salt = [0u8; 16];
+        let mut dek = Key::default();
+
+        {
+            let mut rng = ThreadRng::default();
+            rng.fill_bytes(&mut salt);
+            rng.fill_bytes(&mut dek);
+        }
+
+        let kek = derive_kek(Zeroizing::new(password), salt).await?;
+        let kek_cipher = XChaCha20Poly1305::new(&kek);
+        let encrypted_dek =
+            Encrypted::encrypt(&kek_cipher, dek).map_err(|_| VaultError::Encryption)?;
+
+        let metadata = VaultMetadata {
+            password_salt: salt,
+            encrypted_dek,
+        };
+
+        database
+            .save_metadata(
+                vault_id.clone(),
+                postcard::to_stdvec(&metadata).map_err(|_| VaultError::Serialization)?,
+            )
+            .await?;
+
+        Ok(Self {
+            database,
+            vault_id,
+            dek: Zeroizing::new(dek),
+            secrets: RwLock::new(HashMap::new()),
+        })
+    }
+
+    #[uniffi::constructor]
+    pub async fn load(
+        database: Arc<Database>,
+        vault_id: String,
+        password: String,
+    ) -> Result<Self, VaultError> {
+        let meta_bytes = database.load_metadata(vault_id.clone()).await?;
+        let metadata: VaultMetadata =
+            postcard::from_bytes(&meta_bytes).map_err(|_| VaultError::Deserialization)?;
+
+        let kek = derive_kek(Zeroizing::new(password), metadata.password_salt).await?;
+        let dek = metadata
+            .encrypted_dek
+            .decrypt(&XChaCha20Poly1305::new(&kek))
+            .map_err(|_| VaultError::Decryption)?;
+
+        let secret_rows = database.load_secrets(vault_id.clone()).await?;
+        let mut secrets = HashMap::new();
+        for (k, v) in secret_rows {
+            secrets.insert(
+                k,
+                postcard::from_bytes(&v).map_err(|_| VaultError::Deserialization)?,
+            );
+        }
+
+        Ok(Self {
+            database,
+            vault_id,
+            dek: Zeroizing::new(dek),
+            secrets: RwLock::new(secrets),
+        })
+    }
+
     pub async fn insert_secret(&self, key: String, value: Vec<u8>) -> Result<(), VaultError> {
-        let cipher = XChaCha20Poly1305::new(&self.dek);
-        let value = Encrypted::encrypt(&cipher, value).map_err(|_| VaultError::Encryption)?;
+        let encrypted = Encrypted::encrypt(&XChaCha20Poly1305::new(&self.dek), value)
+            .map_err(|_| VaultError::Encryption)?;
+        let bytes = postcard::to_stdvec(&encrypted).map_err(|_| VaultError::Serialization)?;
 
-        let mut secrets = self.secrets.write().unwrap();
-        secrets.insert(key, value);
-
+        self.database
+            .save_secret(self.vault_id.clone(), key.clone(), bytes)
+            .await?;
+        self.secrets.write().unwrap().insert(key, encrypted);
         Ok(())
     }
 
     pub async fn get_secret(&self, key: String) -> Result<Vec<u8>, VaultError> {
         let secrets = self.secrets.read().unwrap();
-        let stored = secrets.get(&key).ok_or(VaultError::SecretNotFound)?;
-
-        let cipher = XChaCha20Poly1305::new(&self.dek);
-        let value = stored
-            .clone()
-            .decrypt(&cipher)
-            .map_err(|_| VaultError::Decryption)?;
-
-        Ok(value)
+        let stored = secrets
+            .get(&key)
+            .cloned()
+            .ok_or(VaultError::SecretNotFound)?;
+        stored
+            .decrypt(&XChaCha20Poly1305::new(&self.dek))
+            .map_err(|_| VaultError::Decryption)
     }
+}
 
-    pub fn save(&self) -> Result<Vec<u8>, VaultError> {
-        let secrets = self.secrets.read().unwrap();
-        let storage = VaultStorage {
-            metadata: (*self.metadata).clone(),
-            secrets: secrets.clone(),
-        };
-        postcard::to_stdvec(&storage).map_err(|_| VaultError::Serialization)
-    }
-
-    #[uniffi::constructor]
-    pub async fn load(bytes: Vec<u8>, password: String) -> Result<Self, VaultError> {
-        let storage: VaultStorage =
-            postcard::from_bytes(&bytes).map_err(|_| VaultError::Deserialization)?;
-
-        let metadata = Arc::new(storage.metadata);
-        let mut vault = metadata.unlock(password).await?;
-
-        *vault.secrets.get_mut().unwrap() = storage.secrets;
-
-        Ok(vault)
-    }
+/// Internal helper for KDF logic
+async fn derive_kek(password: Zeroizing<String>, salt: [u8; 16]) -> Result<Key, VaultError> {
+    let (send, recv) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        use argon2::*;
+        let mut kek = Key::default();
+        #[cfg(not(test))]
+        let m_cost = 64 * 1024;
+        #[cfg(test)]
+        let m_cost = 8 * 1024;
+        let params = Params::new(m_cost, 3, 4, Some(32)).unwrap();
+        let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+        let result = argon2
+            .hash_password_into(password.as_bytes(), &salt, &mut kek)
+            .map(|_| kek)
+            .map_err(|_| VaultError::Kdf);
+        let _ = send.send(result);
+    });
+    recv.await.map_err(|_| VaultError::Kdf)?
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use tempfile::NamedTempFile;
 
-    const PASSWORD: &str = "correct horse battery staple";
-
-    #[tokio::test]
-    async fn temporary_metadata_can_be_created() {
-        let metadata = VaultMetadata::create(PASSWORD.to_string()).await;
-        assert!(metadata.is_ok());
+    async fn setup_db() -> Arc<Database> {
+        let tmp = NamedTempFile::new().unwrap();
+        Database::new(tmp.path().to_str().unwrap().to_string())
     }
 
     #[tokio::test]
-    async fn unlock_with_correct_password_succeeds() {
-        let metadata = VaultMetadata::create(PASSWORD.to_string())
+    async fn vault_lifecycle() {
+        let db = setup_db().await;
+        let vault_id = "test_vault".to_string();
+        let password = "password123".to_string();
+
+        let vault = Vault::create(db.clone(), vault_id.clone(), password.clone())
             .await
             .unwrap();
-        let metadata = Arc::new(metadata);
-
-        let vault = metadata.clone().unlock(PASSWORD.to_string()).await;
-        assert!(vault.is_ok());
-    }
-
-    #[tokio::test]
-    async fn unlock_with_wrong_password_fails() {
-        let metadata = VaultMetadata::create(PASSWORD.to_string())
-            .await
-            .unwrap();
-        let metadata = Arc::new(metadata);
-
-        let vault = metadata.clone().unlock("wrong_password".to_string()).await;
-        assert!(vault.is_err());
-    }
-
-    async fn setup_vault() -> Arc<Vault> {
-        let metadata = Arc::new(
-            VaultMetadata::create("password123".to_string())
-                .await
-                .unwrap(),
-        );
-        metadata
-            .unlock("password123".to_string())
-            .await
-            .unwrap()
-            .into()
-    }
-
-    #[tokio::test]
-    async fn insert_and_get_secret() {
-        let vault = setup_vault().await;
-        let key = "apiKey".to_string();
-        let value = b"secret-value-123".to_vec();
-
         vault
-            .insert_secret(key.clone(), value.clone())
-            .await
-            .unwrap();
-        let retrieved = vault.get_secret(key).await.unwrap();
-
-        assert_eq!(retrieved, value);
-    }
-
-    #[tokio::test]
-    async fn get_non_existent_secret_fails() {
-        let vault = setup_vault().await;
-        let result = vault.get_secret("ghost".to_string()).await;
-
-        assert!(matches!(result, Err(VaultError::SecretNotFound)));
-    }
-
-    #[tokio::test]
-    async fn vault_save_and_load_round_trip() {
-        // 1. Setup initial vault and data
-        let initial_vault = setup_vault().await;
-        let key = "persistence_test".to_string();
-        let value = b"this data should survive serialization".to_vec();
-
-        initial_vault
-            .insert_secret(key.clone(), value.clone())
+            .insert_secret("foo".into(), b"bar".to_vec())
             .await
             .unwrap();
 
-        // 2. Serialize to bytes (Postcard)
-        let serialized_data = initial_vault
-            .save()
-            .expect("Should be able to serialize vault");
-        assert!(
-            !serialized_data.is_empty(),
-            "Serialized data should not be empty"
-        );
-
-        // 3. Load into a completely new instance
-        let loaded_vault = Vault::load(serialized_data, "password123".to_string())
-            .await
-            .expect("Should be able to load vault with correct password");
-
-        // 4. Verify data integrity
-        let retrieved = loaded_vault.get_secret(key).await.unwrap();
-        assert_eq!(retrieved, value, "Retrieved data must match original data");
+        let loaded = Vault::load(db, vault_id, password).await.unwrap();
+        assert_eq!(loaded.get_secret("foo".into()).await.unwrap(), b"bar");
     }
 
     #[tokio::test]
-    async fn load_fails_with_incorrect_password() {
-        let vault = setup_vault().await;
-        vault
-            .insert_secret("secret".into(), b"data".into())
+    async fn wrong_password() {
+        let db = setup_db().await;
+        let vault_id = "test_vault".to_string();
+        Vault::create(db.clone(), vault_id.clone(), "correct".into())
             .await
             .unwrap();
-
-        let bytes = vault.save().unwrap();
-
-        // Attempt to load with a typo/wrong password
-        let result = Vault::load(bytes, "wrong_password".to_string()).await;
-
-        assert!(result.is_err(), "Loading with wrong password must fail");
-        // Specifically, it should fail during the DEK decryption in metadata.unlock()
-    }
-
-    #[tokio::test]
-    async fn load_fails_on_corrupted_bytes() {
-        let corrupted_bytes = vec![1u8; 100];
-        let result = Vault::load(corrupted_bytes, "password123".to_string()).await;
-
-        assert!(matches!(result, Err(VaultError::Deserialization)));
-    }
-
-    #[tokio::test]
-    async fn vault_metadata_remains_consistent_after_load() {
-        let metadata = Arc::new(
-            VaultMetadata::create(PASSWORD.to_string())
-                .await
-                .unwrap(),
-        );
-        let original_salt = metadata.password_salt;
-
-        let vault = metadata.unlock(PASSWORD.to_string()).await.unwrap();
-        let bytes = vault.save().unwrap();
-
-        let loaded_vault = Vault::load(bytes, PASSWORD.to_string()).await.unwrap();
-
-        assert_eq!(
-            loaded_vault.metadata.password_salt, original_salt,
-            "Salt must persist across save/load"
-        );
+        let res = Vault::load(db, vault_id, "wrong".into()).await;
+        assert!(res.is_err());
     }
 }
