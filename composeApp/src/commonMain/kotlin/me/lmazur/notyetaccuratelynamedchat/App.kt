@@ -1,49 +1,200 @@
 package me.lmazur.notyetaccuratelynamedchat
 
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.foundation.Image
-import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.safeContentPadding
-import androidx.compose.material3.Button
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
+import androidx.compose.foundation.layout.*
+import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.tooling.preview.Preview
-import org.jetbrains.compose.resources.painterResource
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.launch
+import uniffi.compose_app.Vault
+import uniffi.compose_app.VaultMetadata
 
-import notyetaccuratelynamedchat.composeapp.generated.resources.Res
-import notyetaccuratelynamedchat.composeapp.generated.resources.compose_multiplatform
+/**
+ * State manager for the Vault.
+ */
+object VaultManager {
+    var activeVault by mutableStateOf<Vault?>(null)
+        private set
+
+    var metadata by mutableStateOf<VaultMetadata?>(null)
+
+    fun unlock(vault: Vault) {
+        activeVault = vault
+    }
+
+    fun lock() {
+        activeVault = null
+    }
+}
 
 @Composable
-@Preview
 fun App() {
     MaterialTheme {
-        var showContent by remember { mutableStateOf(false) }
-        Column(
-            modifier = Modifier
-                .background(MaterialTheme.colorScheme.primaryContainer)
-                .safeContentPadding()
-                .fillMaxSize(),
-            horizontalAlignment = Alignment.CenterHorizontally,
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            color = MaterialTheme.colorScheme.background
         ) {
-            Button(onClick = { showContent = !showContent }) {
-                Text("Click me!")
-            }
-            AnimatedVisibility(showContent) {
-                val greeting = remember { Greeting().greet() }
-                Column(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                ) {
-                    Image(painterResource(Res.drawable.compose_multiplatform), null)
-                    Text("Compose: $greeting")
-                }
+            val currentVault = VaultManager.activeVault
+
+            if (currentVault == null) {
+                UnlockVaultScreen(
+                    metadata = VaultManager.metadata,
+                    onVaultUnlocked = { VaultManager.unlock(it) },
+                    onMetadataCreated = { VaultManager.metadata = it }
+                )
+            } else {
+                AuthenticatedVaultScreen(
+                    onLockRequested = { VaultManager.lock() }
+                )
             }
         }
     }
+}
+
+/**
+ * Screen displayed when the vault is locked or needs to be created.
+ */
+@Composable
+fun UnlockVaultScreen(
+    metadata: VaultMetadata?,
+    onVaultUnlocked: (Vault) -> Unit,
+    onMetadataCreated: (VaultMetadata) -> Unit
+) {
+    val scope = rememberCoroutineScope()
+    var password by remember { mutableStateOf("") }
+    var isLoading by remember { mutableStateOf(false) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+
+    val isCreationMode = metadata == null
+
+    Column(
+        modifier = Modifier
+            .safeContentPadding()
+            .padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text(
+            text = if (isCreationMode) "Create Vault" else "Unlock Vault",
+            style = MaterialTheme.typography.headlineMedium
+        )
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        PasswordTextField(
+            value = password,
+            onValueChange = { password = it },
+            enabled = !isLoading,
+            isError = errorMessage != null
+        )
+
+        if (errorMessage != null) {
+            Text(
+                text = errorMessage!!,
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(top = 8.dp)
+            )
+        }
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        Button(
+            modifier = Modifier.fillMaxWidth(),
+            enabled = !isLoading && password.isNotEmpty(),
+            onClick = {
+                scope.launch {
+                    isLoading = true
+                    errorMessage = null
+                    try {
+                        val vault = if (isCreationMode) {
+                            val newMeta = VaultMetadata.create(password)
+                            onMetadataCreated(newMeta)
+                            newMeta.unlock(password)
+                        } else {
+                            metadata.unlock(password)
+                        }
+
+                        onVaultUnlocked(vault)
+                        password = "" // Clear sensitive data from memory
+                    } catch (_: Exception) {
+                        errorMessage = "Invalid password or encryption error"
+                    } finally {
+                        isLoading = false
+                    }
+                }
+            }
+        ) {
+            if (isLoading) {
+                CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
+            } else {
+                Text("Enter")
+            }
+        }
+    }
+}
+
+/**
+ * Screen displayed once the vault is successfully unlocked.
+ */
+@Composable
+fun AuthenticatedVaultScreen(onLockRequested: () -> Unit) {
+    Column(
+        modifier = Modifier
+            .safeContentPadding()
+            .padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text("Vault Unlocked", style = MaterialTheme.typography.headlineSmall)
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // Placeholder for vault content (e.g., a list of secrets)
+        Card(
+            modifier = Modifier.fillMaxWidth().weight(1f, fill = false),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceVariant
+            )
+        ) {
+            Box(Modifier.padding(16.dp).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Text("Your secure content goes here", style = MaterialTheme.typography.bodyMedium)
+            }
+        }
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        Button(
+            onClick = onLockRequested,
+            colors = ButtonDefaults.buttonColors(
+                containerColor = MaterialTheme.colorScheme.secondary
+            )
+        ) {
+            Text("Lock Vault")
+        }
+    }
+}
+
+/**
+ * A reusable password input field.
+ */
+@Composable
+fun PasswordTextField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    enabled: Boolean,
+    isError: Boolean
+) {
+    OutlinedTextField(
+        value = value,
+        onValueChange = onValueChange,
+        label = { Text("Password") },
+        visualTransformation = PasswordVisualTransformation(),
+        modifier = Modifier.fillMaxWidth(),
+        enabled = enabled,
+        isError = isError,
+        singleLine = true
+    )
 }
