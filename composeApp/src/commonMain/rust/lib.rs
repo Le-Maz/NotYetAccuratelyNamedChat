@@ -109,7 +109,7 @@ impl VaultMetadata {
 #[uniffi::export]
 impl VaultMetadata {
     #[uniffi::constructor]
-    pub async fn temporary(password: String) -> Result<Self, VaultError> {
+    pub async fn create(password: String) -> Result<Self, VaultError> {
         let (password_salt, dek) = {
             let mut rng = ThreadRng::default();
             let mut salt = [0u8; Self::SALT_LENGTH];
@@ -149,7 +149,6 @@ impl VaultMetadata {
 }
 
 #[derive(uniffi::Object)]
-#[allow(unused)]
 pub struct Vault {
     metadata: Arc<VaultMetadata>,
     dek: Zeroizing<Key>,
@@ -219,13 +218,13 @@ mod tests {
 
     #[tokio::test]
     async fn temporary_metadata_can_be_created() {
-        let metadata = VaultMetadata::temporary(PASSWORD.to_string()).await;
+        let metadata = VaultMetadata::create(PASSWORD.to_string()).await;
         assert!(metadata.is_ok());
     }
 
     #[tokio::test]
     async fn unlock_with_correct_password_succeeds() {
-        let metadata = VaultMetadata::temporary(PASSWORD.to_string())
+        let metadata = VaultMetadata::create(PASSWORD.to_string())
             .await
             .unwrap();
         let metadata = Arc::new(metadata);
@@ -236,7 +235,7 @@ mod tests {
 
     #[tokio::test]
     async fn unlock_with_wrong_password_fails() {
-        let metadata = VaultMetadata::temporary(PASSWORD.to_string())
+        let metadata = VaultMetadata::create(PASSWORD.to_string())
             .await
             .unwrap();
         let metadata = Arc::new(metadata);
@@ -247,7 +246,7 @@ mod tests {
 
     async fn setup_vault() -> Arc<Vault> {
         let metadata = Arc::new(
-            VaultMetadata::temporary("password123".to_string())
+            VaultMetadata::create("password123".to_string())
                 .await
                 .unwrap(),
         );
@@ -340,7 +339,7 @@ mod tests {
     #[tokio::test]
     async fn vault_metadata_remains_consistent_after_load() {
         let metadata = Arc::new(
-            VaultMetadata::temporary(PASSWORD.to_string())
+            VaultMetadata::create(PASSWORD.to_string())
                 .await
                 .unwrap(),
         );
